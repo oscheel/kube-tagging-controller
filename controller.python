@@ -1,0 +1,79 @@
+import random
+import time
+import logging
+from kubernetes import client, config
+import boto3
+
+MAX_RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY_SECONDS = 5
+
+def tag_pod_with_instance_id(pod_name, instance_id):
+    core_v1_api = client.CoreV1Api()
+
+    # Add or update the 'instance-id' label on the pod
+    body = {
+        'metadata': {
+            'labels': {
+                'instance-id': instance_id
+            }
+        }
+    }
+    core_v1_api.patch_namespaced_pod(pod_name, 'default', body)
+
+def get_node_instance_id(node_name):
+    ec2_client = boto3.client('ec2', region_name='us-west-2')
+
+    # Retrieve the instance ID of the node using AWS EC2 API
+    response = ec2_client.describe_instances(
+        Filters=[
+            {
+                'Name': 'tag:Name',
+                'Values': [node_name]
+            }
+        ]
+    )
+    instance_id = response['Reservations'][0]['Instances'][0]['InstanceId']
+    return instance_id
+
+def process_pod_event(pod, retry_attempts=0):
+    if not pod.spec.node_name:
+        return
+    
+    node_name = pod.spec.node_name
+    try:
+        instance_id = get_node_instance_id(node_name)
+        tag_pod_with_instance_id(pod.metadata.name, instance_id)
+        logging.info(f"Tagged pod {pod.metadata.name} with instance ID {instance_id}")
+    except Exception as e:
+        if retry_attempts < MAX_RETRY_ATTEMPTS:
+            retry_attempts += 1
+            delay = calculate_retry_delay(retry_attempts)
+            logging.warning(f"Error while processing pod {pod.metadata.name}. Retrying in {delay} seconds.")
+            time.sleep(delay)
+            process_pod_event(pod, retry_attempts)
+        else:
+            logging.error(f"Error while processing pod {pod.metadata.name}. Maximum retry attempts exceeded.")
+            logging.error(f"Last error: {e}")
+
+def calculate_retry_delay(retry_attempts):
+    base_delay = RETRY_BASE_DELAY_SECONDS * (2 ** (retry_attempts - 1))
+    jitter = random.uniform(0.5, 1.5)
+    return base_delay * jitter
+
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    config.load_kube_config()
+    core_v1_api = client.CoreV1Api()
+    w = client.Watch()
+
+    # Watch for pod events
+    for event in w.stream(core_v1_api.list_pod_for_all_namespaces):
+        pod = event['object']
+        if event['type'] == 'ADDED' or event['type'] == 'MODIFIED':
+            try:
+                process_pod_event(pod)
+            except Exception as e:
+                logging.error(f"Error while processing pod event: {e}")
+
+if __name__ == '__main__':
+    main()
